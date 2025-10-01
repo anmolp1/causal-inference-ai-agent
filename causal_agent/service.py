@@ -17,6 +17,7 @@ from .agent import CausalInferenceAgent, CausalInferenceConfig
 from .policy import NextBestActionPolicy, PolicyConfig, ActionSpec
 from .kg_client import KnowledgeGraphClient
 from .validation_client import ValidationClient
+from .metrics import evaluate_uplift
 
 
 # Prometheus metrics
@@ -66,6 +67,9 @@ class RecommendRequest(EstimateRequest):
 	fairness_groups: Optional[Dict[str, List[str]]] = None
 	# Optional customer value vector aligned to customer_ids for ROI scoring
 	customer_values: Optional[List[float]] = None
+	# For evaluation endpoint reuse
+	experiment_treatment: Optional[List[int]] = None
+	experiment_outcome: Optional[List[int]] = None
 
 
 class Recommendation(BaseModel):
@@ -178,6 +182,28 @@ def recommend(req: RecommendRequest, request: Request) -> RecommendResponse:
 			validation_result = validator.validate(validation_payload)
 			REQUEST_COUNT.labels(endpoint, "200").inc()
 			return RecommendResponse(recommendations=[Recommendation(**r) for r in recs], validation=validation_result)
+class EvaluateRequest(BaseModel):
+	uplift_scores: List[float]
+	treatment: List[int]
+	outcome: List[int]
+	k_fracs: Optional[List[float]] = None
+
+
+class EvaluateResponse(BaseModel):
+	metrics: Dict[str, float]
+
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+def evaluate(req: EvaluateRequest) -> EvaluateResponse:
+	endpoint = "/evaluate"
+	with REQUEST_LATENCY.labels(endpoint).time():
+		try:
+			scores = np.asarray(req.uplift_scores, dtype=float)
+			t = np.asarray(req.treatment, dtype=int)
+			y = np.asarray(req.outcome, dtype=int)
+			metrics = evaluate_uplift(scores, t, y, k_fracs=req.k_fracs or [0.1, 0.2, 0.3])
+			REQUEST_COUNT.labels(endpoint, "200").inc()
+			return EvaluateResponse(metrics=metrics)
 		except Exception as e:
 			REQUEST_COUNT.labels(endpoint, "500").inc()
 			raise HTTPException(status_code=500, detail=str(e))
