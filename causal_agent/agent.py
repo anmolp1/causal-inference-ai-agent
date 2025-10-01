@@ -51,6 +51,7 @@ class CausalInferenceAgent:
 		self._model: Any = None
 		self._t_model: Any = None
 		self._c_model: Any = None
+		self._model_version: str = "v0"
 
 	def _fit_dr(self, X: np.ndarray, w: np.ndarray, y: np.ndarray) -> None:
 		final_model = RandomForestRegressor(
@@ -124,7 +125,11 @@ class CausalInferenceAgent:
 		uplift = cate.copy()
 		ate = float(np.mean(cate))
 		ci = self._bootstrap_ate_ci(X, w, y)
-		return CausalEstimate(ate=ate, ate_ci=ci, cate=cate, uplift=uplift, meta={})
+		meta: Dict[str, Any] = {
+			"model_version": self._model_version,
+			"econml": bool(econml_available),
+		}
+		return CausalEstimate(ate=ate, ate_ci=ci, cate=cate, uplift=uplift, meta=meta)
 
 	def _bootstrap_ate_ci(self, X: np.ndarray, w: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, float]]:
 		alpha = 1.0 - self.config.bootstrap_ci

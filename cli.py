@@ -8,6 +8,7 @@ import pandas as pd
 from causal_agent.data_interface import DataInterface, DatasetSpec
 from causal_agent.agent import CausalInferenceAgent, CausalInferenceConfig
 from causal_agent.policy import NextBestActionPolicy, PolicyConfig
+from causal_agent.service import app as service_app  # expose FastAPI app for uvicorn
 
 
 def main() -> None:
