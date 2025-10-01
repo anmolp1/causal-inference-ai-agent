@@ -64,6 +64,8 @@ class RecommendRequest(EstimateRequest):
 
 	# Optional fairness grouping inputs: mapping group_name -> list aligned to customer_ids
 	fairness_groups: Optional[Dict[str, List[str]]] = None
+	# Optional customer value vector aligned to customer_ids for ROI scoring
+	customer_values: Optional[List[float]] = None
 
 
 class Recommendation(BaseModel):
@@ -144,6 +146,7 @@ def recommend(req: RecommendRequest, request: Request) -> RecommendResponse:
 				feature_cols=None,
 				X=None,
 				action_label=req.action_label,
+				customer_values=np.asarray(req.customer_values, dtype=float) if req.customer_values is not None else None,
 			)
 
 			# Build fairness slices if provided

@@ -25,6 +25,11 @@ class PolicyConfig:
     confidence_ate_positive: float = 0.9
     budget_fraction: Optional[float] = None  # if set, cap top fraction by uplift
     actions: Optional[List[ActionSpec]] = None  # action catalog
+    budget_total: Optional[float] = None  # absolute budget cap across selections
+    require_positive_net_value: bool = True  # abstain if expected net <= 0
+    abstain_if_ci_crosses_zero: bool = True  # abstain if ATE CI spans <= 0
+    return_alternatives: bool = True
+    num_alternatives: int = 2
 
 
 
@@ -46,6 +51,7 @@ class NextBestActionPolicy:
         feature_cols: Optional[List[str]] = None,
         X: Optional[np.ndarray] = None,
         action_label: str = "offer_coupon",
+        customer_values: Optional[np.ndarray] = None,
     ) -> List[Dict[str, str]]:
 		indices = np.argsort(-uplift)
 		sorted_ids = [customer_ids[i] for i in indices]
@@ -74,25 +80,83 @@ class NextBestActionPolicy:
                 selected.append(indices[i])
 
 
-        # Choose action: if catalog present, pick min-cost by default (placeholder for ROI model)
-        chosen_action = action_label
-        if self.config.actions:
-            elig = [a for a in self.config.actions if a.eligible]
-            if elig:
-                elig_sorted = sorted(elig, key=lambda a: a.cost)
-                chosen_action = elig_sorted[0].label
+        # ROI-aware selection: compute expected net value per customer and pick best action
+        values = customer_values if customer_values is not None else np.ones_like(uplift, dtype=float)
+
+        candidates: List[Tuple[int, str, float, float]] = []  # (idx, action_label, cost, net_value)
+        for idx in selected:
+            u = float(uplift[idx])
+            v = float(values[idx])
+            # CI-based abstain check (using ATE CI as proxy)
+            if self.config.abstain_if_ci_crosses_zero and ate_ci is not None:
+                lo, hi = ate_ci
+                if lo <= 0 <= hi:
+                    # skip this customer entirely if uncertain overall effect
+                    continue
+
+            best_label = action_label
+            best_cost = 0.0
+            best_net = u * v
+            ranked: List[Tuple[str, float, float]] = []  # (label, cost, net)
+            if self.config.actions:
+                elig = [a for a in self.config.actions if a.eligible]
+                if elig:
+                    best_net = -1e18
+                    for a in elig:
+                        net = u * v - float(a.cost)
+                        if net > best_net:
+                            best_net = net
+                            best_label = a.label
+                            best_cost = float(a.cost)
+                        ranked.append((a.label, float(a.cost), net))
+            else:
+                # If no actions provided, assume zero cost for the default action
+                best_cost = 0.0
+                best_net = u * v
+                ranked.append((best_label, best_cost, best_net))
+
+            if (not self.config.require_positive_net_value) or (best_net > 0):
+                candidates.append((idx, best_label, best_cost, best_net))
+            # attach ranked alternatives to object cache for later explanation
+            # We will recompute lightweight alternatives when building recs
+
+        # Sort by net value descending
+        candidates.sort(key=lambda t: -t[3])
+
+        # Apply absolute budget if configured
+        total_cost = 0.0
+        rec_indices: List[Tuple[int, str, float, float]] = []
+        for idx, label, cost, net in candidates[:cap]:
+            if self.config.budget_total is not None and (total_cost + cost) > self.config.budget_total:
+                continue
+            total_cost += cost
+            rec_indices.append((idx, label, cost, net))
 
         recs: List[Dict[str, str]] = []
-        for idx in selected:
+        for idx, label, cost, net in rec_indices:
             cid = customer_ids[idx]
             score = float(uplift[idx])
-            expl = self._explain_single(idx, X, feature_cols) if X is not None and feature_cols is not None else "uplift above threshold"
-            recs.append({
+            expl = self._explain_single(idx, X, feature_cols) if X is not None and feature_cols is not None else "roi-optimized action"
+            rec: Dict[str, str] = {
                 "customer_id": str(cid),
                 "uplift_score": f"{score:.6f}",
-                "recommend_action": chosen_action,
+                "recommend_action": label,
                 "explanation": expl,
-            })
+                "expected_net_value": f"{net:.6f}",
+            }
+            # compute alternatives if enabled
+            if self.config.return_alternatives and self.config.actions:
+                u = float(uplift[idx])
+                v = float(values[idx])
+                alts = []
+                for a in self.config.actions:
+                    if not a.eligible or a.label == label:
+                        continue
+                    net_alt = u * v - float(a.cost)
+                    alts.append({"action": a.label, "expected_net_value": f"{net_alt:.6f}"})
+                alts.sort(key=lambda x: -float(x["expected_net_value"]))
+                rec["alternative_actions"] = alts[: max(0, int(self.config.num_alternatives))]
+            recs.append(rec)
         return recs
 
 
