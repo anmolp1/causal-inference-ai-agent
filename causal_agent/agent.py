@@ -17,6 +17,13 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
+import os
+from joblib import dump, load
+try:
+	import mlflow  # type: ignore
+	mlflow_available = True
+except Exception:  # pragma: no cover
+	mlflow_available = False
 
 
 @dataclass
@@ -52,6 +59,7 @@ class CausalInferenceAgent:
 		self._t_model: Any = None
 		self._c_model: Any = None
 		self._model_version: str = "v0"
+		self._artifact_path: Optional[str] = None
 
 	def _fit_dr(self, X: np.ndarray, w: np.ndarray, y: np.ndarray) -> None:
 		final_model = RandomForestRegressor(
@@ -129,7 +137,49 @@ class CausalInferenceAgent:
 			"model_version": self._model_version,
 			"econml": bool(econml_available),
 		}
+		if mlflow_available:
+			try:
+				mlflow.log_param("model_version", self._model_version)
+				mlflow.log_metric("ate", ate)
+				if ci is not None:
+					mlflow.log_metric("ate_lo", float(ci[0]))
+					mlflow.log_metric("ate_hi", float(ci[1]))
+			except Exception:
+				pass
 		return CausalEstimate(ate=ate, ate_ci=ci, cate=cate, uplift=uplift, meta=meta)
+
+	def save(self, path: str) -> None:
+		"""Persist fitted models."""
+		os.makedirs(path, exist_ok=True)
+		if econml_available and self._model is not None:
+			dump(self._model, os.path.join(path, "dr_learner.joblib"))
+		else:
+			if self._t_model is not None:
+				dump(self._t_model, os.path.join(path, "t_model.joblib"))
+			if self._c_model is not None:
+				dump(self._c_model, os.path.join(path, "c_model.joblib"))
+		with open(os.path.join(path, "meta.txt"), "w") as f:
+			f.write(self._model_version)
+		self._artifact_path = path
+
+	def load_artifacts(self, path: str) -> None:
+		"""Load previously saved models."""
+		try:
+			if os.path.exists(os.path.join(path, "dr_learner.joblib")):
+				self._model = load(os.path.join(path, "dr_learner.joblib"))
+				self._fitted = True
+			else:
+				if os.path.exists(os.path.join(path, "t_model.joblib")):
+					self._t_model = load(os.path.join(path, "t_model.joblib"))
+				if os.path.exists(os.path.join(path, "c_model.joblib")):
+					self._c_model = load(os.path.join(path, "c_model.joblib"))
+				self._fitted = self._t_model is not None and self._c_model is not None
+			mv = os.path.join(path, "meta.txt")
+			if os.path.exists(mv):
+				with open(mv, "r") as f:
+					self._model_version = f.read().strip()
+		except Exception:
+			self._fitted = False
 
 	def _bootstrap_ate_ci(self, X: np.ndarray, w: np.ndarray, y: np.ndarray) -> Optional[Tuple[float, float]]:
 		alpha = 1.0 - self.config.bootstrap_ci

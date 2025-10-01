@@ -11,3 +11,5 @@ prometheus-client>=0.16
 pydantic>=2.0
 neo4j>=5.14
 kafka-python>=2.0
+mlflow>=2.14
+joblib>=1.3

@@ -16,6 +16,7 @@ from datetime import datetime
 from .agent import CausalInferenceAgent, CausalInferenceConfig
 from .policy import NextBestActionPolicy, PolicyConfig, ActionSpec
 from .kg_client import KnowledgeGraphClient
+from .validation_client import ValidationClient
 
 
 # Prometheus metrics
@@ -33,6 +34,7 @@ class EstimateRequest(BaseModel):
 	treatment: conlist(int, min_items=1) = Field(..., description="Binary treatment assignments length n_samples")
 	outcome: conlist(float, min_items=1) = Field(..., description="Outcome values length n_samples")
 	config: Optional[Dict[str, Any]] = Field(default=None, description="Optional agent config overrides")
+	artifacts_path: Optional[str] = Field(default=None, description="Optional path to save model artifacts")
 	
 	class Config:
 		extra = "ignore"
@@ -59,6 +61,9 @@ class RecommendRequest(EstimateRequest):
 	
 	class Config:
 		extra = "ignore"
+
+	# Optional fairness grouping inputs: mapping group_name -> list aligned to customer_ids
+	fairness_groups: Optional[Dict[str, List[str]]] = None
 
 
 class Recommendation(BaseModel):
@@ -98,6 +103,12 @@ def estimate(req: EstimateRequest, request: Request) -> EstimateResponse:
 			w = np.asarray(req.treatment, dtype=int)
 			y = np.asarray(req.outcome, dtype=float)
 			est = agent.estimate(X, w, y)
+			# Optional save of artifacts
+			if req.artifacts_path:
+				try:
+					agent.save(req.artifacts_path)
+				except Exception:
+					pass
 			REQUEST_COUNT.labels(endpoint, "200").inc()
 			try:
 				UPLIFT_MEAN.observe(float(np.mean(est.uplift)))
@@ -135,8 +146,33 @@ def recommend(req: RecommendRequest, request: Request) -> RecommendResponse:
 				action_label=req.action_label,
 			)
 
-			# Placeholder validation hook (to be replaced by real Bias/Validation service)
-			validation_result = {"approved": True, "notes": "pass-through"}
+			# Build fairness slices if provided
+			fairness: Dict[str, Dict[str, Dict[str, float]]] = {}
+			if req.fairness_groups:
+				upl = np.asarray(est.uplift)
+				for gname, values in req.fairness_groups.items():
+					if not values or len(values) != len(req.customer_ids):
+						continue
+					group_map: Dict[str, Dict[str, float]] = {}
+					# aggregate by value
+					stats: Dict[str, List[float]] = {}
+					for i, val in enumerate(values):
+						stats.setdefault(str(val), []).append(float(upl[i]))
+					for val, arr in stats.items():
+						if arr:
+							mean_u = float(np.mean(arr))
+							group_map[str(val)] = {"mean_uplift": mean_u, "count": float(len(arr))}
+					fairness[gname] = group_map
+
+			# Validation hook (real client, env-configurable)
+			validator = ValidationClient()
+			validation_payload = {
+				"ate": est.ate,
+				"ate_ci": est.ate_ci,
+				"recommendations": recs,
+				"fairness_slices": fairness,
+			}
+			validation_result = validator.validate(validation_payload)
 			REQUEST_COUNT.labels(endpoint, "200").inc()
 			return RecommendResponse(recommendations=[Recommendation(**r) for r in recs], validation=validation_result)
 		except Exception as e:
@@ -158,6 +194,11 @@ class KGRoundTripRequest(BaseModel):
 	cypher_treatment_outcome: str
 	write_model_version: str = "v0"
 	write_estimate_prefix: str = "causal_estimate"
+	# Schema mapping
+	id_field: str = "customer_id"
+	feature_fields: Optional[List[str]] = None
+	treatment_field: str = "treatment"
+	outcome_field: str = "outcome"
 
 
 @app.post("/kg/estimate-write")
@@ -174,29 +215,38 @@ def kg_estimate_write(req: KGRoundTripRequest) -> Dict[str, int]:
 				# If KG not available, treat as zero work
 				return {"written": 0}
 
-			# Join on customer_id in-memory
-			feat_ids = {r.get("customer_id"): r for r in feat_rows}
+			# Join on configured id field in-memory
+			feat_ids = {str(r.get(req.id_field)): r for r in feat_rows}
 			X: List[List[float]] = []
 			w: List[int] = []
 			y: List[float] = []
 			cust_ids: List[str] = []
 			for r in to_rows:
-				cid = str(r.get("customer_id"))
+				cid = str(r.get(req.id_field))
 				if cid not in feat_ids:
 					continue
 				f = feat_ids[cid]
-				# naive feature vector: all numeric values in feature row except id
+				# Build feature vector from configured fields or all numeric except id
 				fv: List[float] = []
-				for k, v in f.items():
-					if k == "customer_id":
-						continue
-					try:
-						fv.append(float(v))
-					except Exception:
-						continue
+				if req.feature_fields is not None:
+					for k in req.feature_fields:
+						if k == req.id_field:
+							continue
+						try:
+							fv.append(float(f.get(k, 0)))
+						except Exception:
+							fv.append(0.0)
+				else:
+					for k, v in f.items():
+						if k == req.id_field:
+							continue
+						try:
+							fv.append(float(v))
+						except Exception:
+							continue
 				X.append(fv)
-				w.append(int(r.get("treatment", 0)))
-				y.append(float(r.get("outcome", 0.0)))
+				w.append(int(r.get(req.treatment_field, 0)))
+				y.append(float(r.get(req.outcome_field, 0.0)))
 				cust_ids.append(cid)
 
 			if not X:
